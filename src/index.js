@@ -1,5 +1,5 @@
 import defaults from './defaults';
-import { isBlob, errMessageHandler, isImageType, normalizeLength } from './utils/index';
+import { isBlob, isImageType, toRangeInteger } from './utils/index';
 
 export default class ImageCompressor {
   constructor(file, options) {
@@ -11,56 +11,72 @@ export default class ImageCompressor {
     };
     this.aborted = false;
     this.result = null;
+    this.reader = null;
     this.init();
   }
 
   init() {
-    const { file, options } = this;
+    const { file } = this;
 
-    const fileType = file.type;
-    if (!isBlob(file) || isImageType(fileType)) {
-      errMessageHandler(new Error('The first argument must be a Blob object.'), options.error, this);
+    if (!isBlob(file) || isImageType(file.type)) {
+      this.error(new Error('The first argument must be a Blob object.'));
       return;
     }
 
-    this.load();
+    const reader = new FileReader();
+    this.reader = reader;
+    reader.onload = (e) =>{
+      const { result } = e.target;
+      this.load(result);
+    }
+    reader.onabort = () => {
+      this.error(new Error('Aborted to read the image.'));
+    }
+    reader.onerror = () => {
+      this.error(new Error('Failed to read the image.'));
+    }
+    reader.onloadend = () => {
+      this.reader = null;
+    }
   }
 
-  load() {
-    const { file, image, options } = this;
+  load(url) {
+    const { image } = this;
 
-    const url = URL.createObjectURL(file);
     image.onload = () => {
       this.draw();
     };
     image.onabort = () => {
-      errMessageHandler(new Error('Abort to load the image.'), options.error, this);
+      this.error(new Error('Abort to load the image.'));
     };
     image.onerror = () => {
-      errMessageHandler(new Error('Failed to load the image.'), options.error, this);
+      this.error(new Error('Failed to load the image.'));
     };
 
     // arrow load image cross domain
     image.crossOrigin = 'anonymous';
-
-    image.alt = file.name;
     image.src = url;
   }
 
   draw() {
+    if (this.aborted) {
+      return;
+    }
+
     const { file, image, options } = this;
 
     const { naturalWidth, naturalHeight } = image;
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
     const aspectRatio = naturalWidth / naturalHeight;
-    let maxWidth = Math.max(options.maxWidth, 0) || Infinity;
-    let maxHeight = Math.max(options.maxHeight, 0) || Infinity;
+    let maxWidth = Math.max(options.maxWidth, 0);
+    let maxHeight = Math.max(options.maxHeight, 0);
     let minWidth = Math.max(options.minWidth, 0);
     let minHeight = Math.max(options.minHeight, 0);
     let width = Math.max(options.width, 0) || naturalWidth;
     let height = Math.max(options.height, 0) || naturalHeight;
 
+    // init maxWidth and maxHeight
     if (maxWidth < Infinity && maxHeight < Infinity) {
       if (maxHeight * aspectRatio > maxWidth) {
         maxHeight = maxWidth / aspectRatio;
@@ -73,6 +89,7 @@ export default class ImageCompressor {
       maxWidth = maxHeight * aspectRatio;
     }
 
+    // init minWidth and minHeight
     if (minWidth > 0 && minHeight > 0) {
       if (minHeight * aspectRatio > minWidth) {
         minHeight = minWidth / aspectRatio;
@@ -85,19 +102,14 @@ export default class ImageCompressor {
       minWidth = minHeight * aspectRatio;
     }
 
+    // init width and height
     if (height * aspectRatio > width) {
       height = width / aspectRatio;
     } else {
       width = height * aspectRatio;
     }
-
-    width = normalizeLength(width, minWidth, maxWidth);
-    height = normalizeLength(height, minHeight, maxHeight);
-
-    const destX = -width / 2;
-    const destY = -height / 2;
-    const destWidth = width;
-    const destHeight = height;
+    width = toRangeInteger(width, minWidth, maxWidth);
+    height = toRangeInteger(height, minHeight, maxHeight);
 
     canvas.width = width;
     canvas.height = height;
@@ -106,48 +118,32 @@ export default class ImageCompressor {
       options.imageType = file.type;
     }
 
-    if (this.aborted) {
-      return;
-    }
-
-    context.fillRect(0, 0, width, height);
     context.save();
-    context.translate(width / 2, height / 2);
-    context.drawImage(image, destX, destY, destWidth, destHeight);
+    context.clearRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
     context.restore();
 
-    if (this.aborted) {
-      return;
-    }
-
+    // toBlob callback function
     const done = (result) => {
       if (!this.aborted) {
-        this.done({
-          naturalWidth,
-          naturalHeight,
-          result,
-        });
+        this.done(result);
       }
     };
 
     canvas.toBlob(done, options.imageType, options.quality);
   }
 
-  done({ naturalWidth, naturalHeight, result }) {
+  done(result) {
     const { file, options } = this;
 
     if (result) {
-      if (
-        result.size > file.size &&
-        options.imageType === file.type &&
-        !(options.width > naturalWidth || options.height > naturalHeight)
-      ) {
+      // return original file if the result more large than original file
+      if (result.size > file.size && options.imageType === file.type) {
         result = file;
       }
     } else {
       result = file;
     }
-
     this.result = result;
 
     if (options.success) {
@@ -155,16 +151,25 @@ export default class ImageCompressor {
     }
   }
 
-  abort() {
+  error(err) {
     const { options } = this;
+    
+    if (options.error) {
+      options.error.call(this, err);
+    } else {
+      throw err;
+    }
+  }
 
+  // instance method to abort compress image
+  abort() {
     if (!this.aborted) {
       this.aborted = true;
-      if (!this.image.complete) {
+      if (this.reader) {
+        this.reader.abort();
+      } else if (!this.image.complete) {
         this.image.onload = null;
         this.image.onabort();
-      } else {
-        errMessageHandler(new Error('The compression has been aborted.'), options.error, this);
       }
     }
   }
